@@ -21,7 +21,7 @@ def loss_select(loss, opt, to_optim):
         criterion (torch.nn.Module inherited), to_optim (optionally appended)
     """
     if loss == 'smoothap':
-        loss_params  = {'anneal':opt.sigmoid_temperature, 'batch_size':opt.bs, "num_id":int(opt.bs / opt.samples_per_class), 'feat_dims':opt.embed_dim}
+        loss_params  = {'anneal':opt.sigmoid_temperature}
         criterion    = SmoothAP(**loss_params)
     else:
         raise Exception('Loss {} not available!'.format(loss))
@@ -30,6 +30,7 @@ def loss_select(loss, opt, to_optim):
 
 
 """==============================================Smooth-AP========================================"""
+
 
 def sigmoid(tensor, temp=1.0):
     """ temperature controlled sigmoid
@@ -78,68 +79,51 @@ class SmoothAP(torch.nn.Module):
         >>> output.backward()
     """
 
-    def __init__(self, anneal, batch_size, num_id, feat_dims):
+    def __init__(self, anneal):
         """
         Parameters
         ----------
         anneal : float
             the temperature of the sigmoid that is used to smooth the ranking function
-        batch_size : int
-            the batch size being used
-        num_id : int
-            the number of different classes that are represented in the batch
-        feat_dims : int
-            the dimension of the input feature embeddings
         """
         super(SmoothAP, self).__init__()
-
-        assert(batch_size%num_id==0)
-
         self.anneal = anneal
-        self.batch_size = batch_size
-        self.num_id = num_id
-        self.feat_dims = feat_dims
 
-    def forward(self, preds):
-        """Forward pass for all input predictions: preds - (batch_size x feat_dims) """
+    def forward(self, input, target):
+        """
+        Parameters
+        ----------
+        input: N x d
+            tensor of descriptors
+        target: NxN
+            affinity matrix, target[i,j] indicates if samples i and j are similar
+        """
+        batch_size = target.size(0)
+        device = input.device
 
-
-        # ------ differentiable ranking of all retrieval set ------
-        # compute the mask which ignores the relevance score of the query to itself
-        mask = 1.0 - torch.eye(self.batch_size)
-        mask = mask.unsqueeze(dim=0).repeat(self.batch_size, 1, 1)
+        mask = 1.0 - torch.eye(batch_size)
+        mask = mask.unsqueeze(dim=0).repeat(batch_size, 1, 1)
         # compute the relevance scores via cosine similarity of the CNN-produced embedding vectors
-        sim_all = compute_aff(preds)
-        sim_all_repeat = sim_all.unsqueeze(dim=1).repeat(1, self.batch_size, 1)
+        sim_all = compute_aff(input)
+        sim_all_repeat = sim_all.unsqueeze(dim=1).repeat(1, batch_size, 1)
         # compute the difference matrix
         sim_diff = sim_all_repeat - sim_all_repeat.permute(0, 2, 1)
         # pass through the sigmoid
-        sim_sg = sigmoid(sim_diff, temp=self.anneal) * mask.cuda()
+        sim_sg = sigmoid(sim_diff, temp=self.temperature) * mask.to(device)
         # compute the rankings
         sim_all_rk = torch.sum(sim_sg, dim=-1) + 1
 
         # ------ differentiable ranking of only positive set in retrieval set ------
         # compute the mask which only gives non-zero weights to the positive set
-        xs = preds.view(self.num_id, int(self.batch_size / self.num_id), self.feat_dims)
-        pos_mask = 1.0 - torch.eye(int(self.batch_size / self.num_id))
-        pos_mask = pos_mask.unsqueeze(dim=0).unsqueeze(dim=0).repeat(self.num_id, int(self.batch_size / self.num_id), 1, 1)
-        # compute the relevance scores
-        sim_pos = torch.bmm(xs, xs.permute(0, 2, 1))
-        sim_pos_repeat = sim_pos.unsqueeze(dim=2).repeat(1, 1, int(self.batch_size / self.num_id), 1)
-        # compute the difference matrix
-        sim_pos_diff = sim_pos_repeat - sim_pos_repeat.permute(0, 1, 3, 2)
+        pos_mask = (target - torch.eye(batch_size).to(device))
+        # pos_mask = target.unsqueeze(1).repeat(1, batch_size, 1)
+        sim_pos_repeat = sim_all.unsqueeze(dim=1).repeat(1, batch_size, 1)
+        sim_pos_diff = sim_pos_repeat - (sim_pos_repeat * pos_mask).permute(0, 2, 1)
         # pass through the sigmoid
-        sim_pos_sg = sigmoid(sim_pos_diff, temp=self.anneal) * pos_mask.cuda()
+        sim_pos_sg = sigmoid(sim_pos_diff, temp=self.temperature) * pos_mask
         # compute the rankings of the positive set
-        sim_pos_rk = torch.sum(sim_pos_sg, dim=-1) + 1
+        sim_pos_rk = (torch.sum(sim_pos_sg, dim=-1) + target) * target
 
-        # sum the values of the Smooth-AP for all instances in the mini-batch
-        ap = torch.zeros(1).cuda()
-        group = int(self.batch_size / self.num_id)
-        for ind in range(self.num_id):
-            pos_divide = torch.sum(sim_pos_rk[ind] / (sim_all_rk[(ind * group):((ind + 1) * group), (ind * group):((ind + 1) * group)]))
-            ap = ap + ((pos_divide / group) / self.batch_size)
+        ap = ((sim_pos_rk / sim_all_rk).sum(1) * (1 / target.sum(1))).mean()
 
         return (1-ap)
-
-
